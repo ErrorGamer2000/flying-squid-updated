@@ -1,17 +1,17 @@
 const Vec3 = require('vec3').Vec3
 
 module.exports.server = function (serv, { version }) {
-  const mcData = require('minecraft-data')(version)
+  const { registry } = serv
 
-  const redstoneWireType = mcData.blocksByName.redstone_wire.id
-  const redstoneTorchType = mcData.blocksByName.redstone_torch.id
+  const redstoneWireType = registry.blocksByName.redstone_wire.id
+  const redstoneTorchType = registry.blocksByName.redstone_torch.id
 
   let poweredRepeaterType, unpoweredRepeaterType, unlitRedstoneTorchType, repeaterType
   if (!serv.supportFeature('theFlattening')) {
-    unlitRedstoneTorchType = mcData.blocksByName.unlit_redstone_torch.id
-    poweredRepeaterType = mcData.blocksByName.powered_repeater.id
-    unpoweredRepeaterType = mcData.blocksByName.unpowered_repeater.id
-  } else { repeaterType = mcData.blocksByName.repeater.id }
+    unlitRedstoneTorchType = registry.blocksByName.unlit_redstone_torch.id
+    poweredRepeaterType = registry.blocksByName.powered_repeater.id
+    unpoweredRepeaterType = registry.blocksByName.unpowered_repeater.id
+  } else { repeaterType = registry.blocksByName.repeater.id }
   const powerLevel = (block, dir) => {
     if (block.type === redstoneWireType) return block.metadata
     if (block.type === redstoneTorchType) return 15

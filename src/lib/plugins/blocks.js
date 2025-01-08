@@ -1,6 +1,8 @@
+const { skipMcPrefix } = require('../utils')
+
 const Vec3 = require('vec3').Vec3
 
-module.exports.player = function (player, serv) {
+module.exports.player = function (player, serv, { version }) {
   player.changeBlock = async (position, blockType, blockData) => {
     serv.players
       .filter(p => p.world === player.world && player !== p)
@@ -50,17 +52,17 @@ module.exports.player = function (player, serv) {
 }
 
 module.exports.server = function (serv, { version }) {
-  const mcData = require('minecraft-data')(version)
-  const blocks = mcData.blocks
+  const { registry } = serv
+  const blocks = registry.blocks
 
   serv.commands.add({
     base: 'setblock',
     info: 'set a block at a position',
     usage: '/setblock <x> <y> <z> <id> [data]',
     op: true,
-    tab: ['blockX', 'blockY', 'blockZ', 'number'],
+    tab: ['blockX', 'blockY', 'blockZ', 'block', 'number'],
     parse (str) {
-      const results = str.match(/^(~|~?-?[0-9]+) (~|~?-?[0-9]+) (~|~?-?[0-9]+) ([0-9]{1,3})(?: ([0-9]{1,3}))?/)
+      const results = str.match(/^(~|~?-?[0-9]+) (~|~?-?[0-9]+) (~|~?-?[0-9]+) ([\w_:0-9]+)(?: ([0-9]{1,3}))?/)
       if (!results) return false
       return results
     },
@@ -69,7 +71,8 @@ module.exports.server = function (serv, { version }) {
       if (ctx.player) res = res.map((val, i) => serv.posFromString(val, ctx.player.position[['x', 'y', 'z'][i]]))
       else res = res.map((val, i) => serv.posFromString(val, new Vec3(0, 128, 0)[['x', 'y', 'z'][i]]))
 
-      const id = parseInt(params[4], 10)
+      const blockParam = params[4]
+      const id = isNaN(+blockParam) ? registry.blocksByName[skipMcPrefix(blockParam)]?.id : +blockParam
       const data = parseInt(params[5] || 0, 10)
       const stateId = serv.supportFeature('theFlattening') ? (blocks[id].minStateId + data) : (id << 4 | data)
 

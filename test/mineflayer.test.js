@@ -1,31 +1,50 @@
 /* eslint-env mocha */
-
+globalThis.isMocha = true
+const fs = require('fs')
+const { join } = require('path')
 const squid = require('flying-squid')
 const settings = require('../config/default-settings.json')
 const mineflayer = require('mineflayer')
 const { Vec3 } = require('vec3')
+const { onceWithTimeout } = require('../src/lib/utils')
 const expect = require('expect').default
+
+const DEBUG_PACKET_IO = false
 
 function assertPosEqual (actual, expected, precision = 1) {
   expect(actual.distanceTo(expected)).toBeLessThan(precision)
 }
 
-const once = require('event-promise')
+function waitForPromises (map, timeout) {
+  const promises = Object.entries(map)
+  let count = promises.length
+  console.log('🤚 Waiting for', promises.map(([name]) => name))
+  return new Promise((resolve, reject) => {
+    if (timeout) setTimeout(() => reject(new Error('Timeout waiting for promises')), timeout)
+    for (const [name, promise] of promises) {
+      promise.then(() => {
+        count--
+        console.log('👍 Promise', name, 'resolved')
+        if (count === 0) {
+          resolve()
+        }
+      })
+    }
+  })
+}
 
-const { firstVersion, lastVersion } = require('./common/parallel')
+const { once } = require('events')
 
-squid.supportedVersions.forEach((supportedVersion, i) => {
-  if (!(i >= firstVersion && i <= lastVersion)) {
-    return
-  }
+squid.testedVersions.forEach((testedVersion, i) => {
+  const registry = require('prismarine-registry')(testedVersion)
+  const version = registry.version
 
-  const mcData = require('minecraft-data')(supportedVersion)
-  const version = mcData.version
+  const Item = require('prismarine-item')(testedVersion)
 
-  const Item = require('prismarine-item')(supportedVersion)
-
-  describe('server with mineflayer connection ' + version.minecraftVersion, () => {
+  describe('server with mineflayer connection ' + testedVersion + 'v', () => {
+    /** @type {import('mineflayer').Bot} */
     let bot
+    /** @type {import('mineflayer').Bot} */
     let bot2
     let serv
     let entityName
@@ -43,13 +62,24 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
     }
 
     async function waitMessage (bot, message) {
-      const msg1 = await once(bot, 'message')
-      expect(msg1.extra[0].text).toEqual(message)
+      console.log('Waiting for message', [message])
+      onceWithTimeout(bot, 'message', 5000, (msg) => {
+        console.log('*msg', msg)
+        return msg.toString() === message
+      })
     }
 
-    beforeEach(async () => {
+    // Clear the world dir before each test
+    const worldFolder = 'world/test_' + testedVersion
+    const dir = join(__dirname, '../', worldFolder)
+    console.log('Clearing world dir', dir)
+    fs.rmSync(dir, { recursive: true, force: true })
+
+    beforeEach(async function () {
+      console.log('🔻 Running test: ' + this.currentTest.title)
       const options = settings
       options['online-mode'] = false
+      options['everybody-op'] = true
       options.port = 0
       options['view-distance'] = 2
       options.worldFolder = undefined
@@ -62,15 +92,20 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         }
       }
 
+      options.worldFolder = worldFolder
+      options.debug = console.log
       serv = squid.createMCServer(options)
-      if (serv.supportFeature('entityCamelCase')) {
+      if (registry.supportFeature('entityCamelCase')) {
         entityName = 'EnderDragon'
       } else {
         entityName = 'ender_dragon'
       }
 
-      await once(serv, 'listening')
-      const port = serv._server.socketServer.address().port
+      console.log('[test] Waiting for server to start')
+      const [port] = await once(serv, 'listening')
+      await serv.waitForReady()
+      console.log('[test] Server is started on', port, version.minecraftVersion)
+
       bot = mineflayer.createBot({
         host: 'localhost',
         port,
@@ -84,49 +119,81 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         version: version.minecraftVersion
       })
 
-      await Promise.all([once(bot, 'login'), once(bot2, 'login')])
+      if (DEBUG_PACKET_IO) {
+        logClientboundEvents(serv, '')
+        logBotEvents(serv, bot, 1)
+        logBotEvents(serv, bot2, 2)
+      }
+
+      await waitForPromises({
+        'bot spawn': once(bot, 'spawn'),
+        'bot2 spawn': once(bot2, 'spawn'),
+        'bot chunks': waitForReady(bot),
+        'bot2 chunks': waitForReady(bot2)
+      })
       bot.entity.onGround = false
       bot2.entity.onGround = false
+
+      // log what the bot is standing on for debugging
+      const bot1StandingOn = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0))
+      const bot2StandingOn = bot2.blockAt(bot2.entity.position.floored().offset(0, -1, 0))
+      console.log('bot1 is standing on', bot1StandingOn)
+      console.log('bot2 is standing on', bot2StandingOn)
     })
 
-    afterEach(async () => {
-      await serv.quit()
-    })
-
-    function waitSpawnZone (bot, view) {
-      const nbChunksExpected = (view * 2) * (view * 2)
-      let c = 0
-      return new Promise(resolve => {
-        const listener = () => {
-          c++
-          if (c === nbChunksExpected) {
-            bot.removeListener('chunkColumnLoad', listener)
+    function waitForReady (bot) {
+      const viewDistance = 2
+      const testExpectedNoChunks = (viewDistance * 2) * (viewDistance * 2)
+      return new Promise((resolve) => {
+        let recvChunks = 0
+        function onColumnLoad () {
+          recvChunks++
+          if (recvChunks === testExpectedNoChunks) {
+            bot.removeListener('chunkColumnLoad', onColumnLoad)
             resolve()
           }
         }
-        bot.on('chunkColumnLoad', listener)
+        bot.on('chunkColumnLoad', onColumnLoad)
       })
     }
 
-    describe('actions', () => {
-      it('can dig', async () => {
-        await Promise.all([waitSpawnZone(bot, 2), waitSpawnZone(bot2, 2), onGround(bot), onGround(bot2)])
+    afterEach(async () => {
+      console.log('Quitting server...')
+      await serv.quit()
+      console.log('Quit server!')
+    })
 
+    describe('actions', () => {
+      // Log the name of the test being run
+      beforeEach(function () {
+        console.log('🔻 Running actions test: ' + this.currentTest.title)
+      })
+
+      it('can dig', async () => {
         const pos = bot.entity.position.offset(0, -1, 0).floored()
-        const p = once(bot2, 'blockUpdate', { array: true })
-        bot.dig(bot.blockAt(pos))
+        // Set a dirt block below the bot so we can easily dig
+        bot.chat(`/setblock ${pos.x} ${pos.y} ${pos.z} dirt`)
+        await once(bot, `blockUpdate:${pos}`, 4000)
+        console.log('Block at', pos, bot.blockAt(pos))
+
+        const p = onceWithTimeout(bot2, 'blockUpdate', 4000, (old, now) => {
+          return now.type === 0
+        })
+        await bot.dig(bot.blockAt(pos))
+        console.log('Digging...')
 
         const [, newBlock] = await p
+        console.log('Dug.', newBlock)
         assertPosEqual(newBlock.position, pos)
         expect(newBlock.type).toEqual(0)
       })
 
       it('can place a block', async () => {
-        await Promise.all([waitSpawnZone(bot, 2), waitSpawnZone(bot2, 2), onGround(bot), onGround(bot2)])
-
         const pos = bot.entity.position.offset(0, -2, 0).floored()
-        const digPromise = once(bot2, 'blockUpdate', { array: true })
+        const digPromise = once(bot2, 'blockUpdate')
         bot.dig(bot.blockAt(pos))
+
+        console.log(' ✔️ dug block at', pos)
 
         let [, newBlock] = await digPromise
         assertPosEqual(newBlock.position, pos)
@@ -140,17 +207,18 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         bot.creative.setInventorySlot(36, new Item(1, 1))
         await invPromise
 
+        console.log(' ✔️ updated inventory')
+
         const placePromise = once(bot2, 'blockUpdate', { array: true })
         bot.placeBlock(bot.blockAt(pos.offset(0, -1, 0)), new Vec3(0, 1, 0));
         [, newBlock] = await placePromise
+        console.log(' ✔️ placed block at', pos)
         assertPosEqual(newBlock.position, pos)
         expect(newBlock.type).toEqual(1)
       })
 
       it('can open and close a chest', async () => {
-        await Promise.all([waitSpawnZone(bot, 2), onGround(bot), waitSpawnZone(bot2, 2), onGround(bot2)])
-
-        const chestId = mcData.blocksByName.chest.id
+        const chestId = registry.blocksByName.chest.id
         const [x, y, z] = [1, 2, 3]
 
         const states = {
@@ -191,8 +259,11 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
     })
 
     describe('commands', () => {
+      beforeEach(function () {
+        console.log('🔻 Running commands test: ' + this.currentTest.title)
+      })
+
       it('has an help command', async () => {
-        await waitMessagePromise('bot joined the game.')
         bot.chat('/help')
         await once(bot, 'message')
       })
@@ -202,7 +273,11 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
       })
       it('can use /playsound', async () => {
         bot.chat('/playsound ambient.weather.rain')
-        await once(bot, 'soundEffectHeard')
+        // TODO: why are there 2 mineflayer events for this as opposed to one with extra fields?
+        await once(bot, serv.supportFeature('removedNamedSoundEffectPacket')
+          ? 'hardcodedSoundEffectHeard' // 1.19.3+
+          : 'soundEffectHeard'
+        )
       })
 
       function waitDragon () {
@@ -225,7 +300,7 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         bot.chat('/summon ' + entityName)
         await waitDragon()
         bot.chat('/kill @e[type=' + entityName + ']')
-        const entity = await once(bot, 'entityDead')
+        const [entity] = await once(bot, 'entityDead')
         expect(entity.name).toEqual(entityName)
       })
       describe('can use /tp', () => {
@@ -246,14 +321,12 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
           assertPosEqual(bot2.entity.position, bot.entity.position)
         })
         it('can tp with relative positions', async () => {
-          await onGround(bot)
           const initialPosition = bot.entity.position.clone()
           bot.chat('/tp ~1 ~-2 ~3')
           await once(bot, 'forcedMove')
           assertPosEqual(bot.entity.position, initialPosition.offset(1, -2, 3), 2)
         })
         it('can tp somebody else with relative positions', async () => {
-          await Promise.all([onGround(bot), onGround(bot2)])
           const initialPosition = bot2.entity.position.clone()
           bot.chat('/tp bot2 ~1 ~-2 ~3')
           await once(bot2, 'forcedMove')
@@ -261,7 +334,6 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         })
       })
       it('can use /deop', async () => {
-        await waitMessagePromise('bot joined the game.')
         bot.chat('/deop bot')
         await waitMessage(bot, '§7§o[Server: Deopped bot]')
         bot.chat('/op bot')
@@ -269,8 +341,7 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         serv.getPlayer('bot').op = true
       })
       it('can use /setblock', async () => {
-        await Promise.all([waitSpawnZone(bot, 2), onGround(bot)])
-        const chestId = mcData.blocksByName.chest.id
+        const chestId = registry.blocksByName.chest.id
         const p = once(bot, 'blockUpdate:' + new Vec3(1, 2, 3), { array: true })
         bot.chat(`/setblock 1 2 3 ${chestId} 0`)
         const [, newBlock] = await p
@@ -286,22 +357,16 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
         await once(bot2.inventory, 'updateSlot')
         expect(bot2.inventory.slots[36].type).toEqual(1)
       })
-      it.skip('can use tabComplete', () => { // TODO to fix
-        return new Promise((resolve, reject) => {
-          bot.tabComplete('/give', (err, data) => {
-            if (err) {
-              return reject(err)
-            }
-            expect(data[0]).toEqual('bot')
-            return resolve()
-          })
-        })
+      it.skip('can use tabComplete', async () => {
+        const data = await bot.tabComplete('/give ')
+        expect(data).toEqual(['bot', 'bot2', '@p', '@a', '@e', '@r'])
       })
 
       function waitMessagePromise (message) {
         return new Promise((resolve) => {
           const listener = (msg) => {
-            if (msg.extra[0].text === message) {
+            const text = msg.extra?.[0].text ?? msg.text
+            if (text === message) {
               bot.removeListener('message', listener)
               resolve()
             }
@@ -311,7 +376,6 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
       }
 
       it('can use /banlist, /ban, /pardon', async () => {
-        await waitMessagePromise('bot joined the game.')
         bot.chat('/banlist')
         await waitMessagePromise('There are 0 total banned players')
         bot.chat('/ban bot2')
@@ -326,3 +390,51 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
     }).timeout(120 * 1000)
   }).timeout(100 * 1000)
 })
+
+BigInt.prototype.toJSON = function () { // eslint-disable-line no-extend-native
+  return this.toString()
+}
+const SKIP_PACKETS = ['update_time']
+function logBotEvents (serv, bot, prefix) {
+  bot._client.on('packet', (data, meta) => {
+    if (serv.isReady && !SKIP_PACKETS.includes(meta.name)) {
+      console.log(prefix, 'Packet', meta, JSON.stringify(data)?.slice(0, 60))
+    }
+  })
+  bot._client.on('state', (now, old) => {
+    console.log(prefix, '~ Client State Change', now, old)
+  })
+  bot.on('kicked', (...a) => {
+    console.warn(prefix, '*Bot kicked', a)
+  })
+  bot.on('error', (err) => {
+    console.error(prefix, '*Bot error', err)
+    process.exit(1)
+  })
+  bot._client.socket.on('error', (err) => {
+    console.error(prefix, '*SOCKET Bot error', err)
+    process.exit(1)
+  })
+  bot.on('end', (reason) => {
+    console.log(prefix, '*Bot END', reason)
+  })
+  const oldWrite = bot._client.write
+  bot._client.write = (name, payload) => {
+    if (SKIP_PACKETS.includes(name)) return
+    console.log(prefix, 'C->S', [name], JSON.stringify(payload)?.slice(0, 60))
+    return oldWrite.call(bot._client, name, payload)
+  }
+}
+function logClientboundEvents (serv, prefix = '') {
+  serv._server.on('connection', (client) => {
+    client.on('state', (now, old) => {
+      console.log(prefix, '~ Server State Change', now, old)
+    })
+    const oldWrite = client.write
+    client.write = (name, param) => {
+      if (SKIP_PACKETS.includes(name)) return
+      console.log(prefix, 'S->C', client.username, [name], JSON.stringify(param)?.slice(0, 60))
+      return oldWrite.call(client, name, param)
+    }
+  })
+}

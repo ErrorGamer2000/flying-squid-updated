@@ -1,26 +1,23 @@
-const path = require('path')
-const requireIndex = require('../requireindex')
-const plugins = requireIndex(path.join(__dirname, '..', 'plugins'))
 const UserError = require('flying-squid').UserError
 const UUID = require('uuid-1345')
+const { skipMcPrefix } = require('../utils')
 const Vec3 = require('vec3').Vec3
 
-module.exports.server = function (serv, options) {
-  const version = options.version
+const plugins = require('./index')
 
-  const Entity = require('prismarine-entity')(version)
-  const mcData = require('minecraft-data')(version)
-  const mobsById = mcData.mobs
-  const objectsById = mcData.objects
+module.exports.server = function (serv, options) {
+  const { registry } = serv
+  const Entity = require('prismarine-entity')(registry)
+
+  const mobsById = registry.mobs
+  const objectsById = registry.objects
 
   serv.initEntity = (type, entityType, world, position) => {
     if (Object.keys(serv.entities).length > options['max-entities']) { throw new Error('Too many mobs !') }
     serv.entityMaxId++
     const entity = new Entity(serv.entityMaxId)
 
-    Object.keys(plugins)
-      .filter(pluginName => plugins[pluginName].entity !== undefined)
-      .forEach(pluginName => plugins[pluginName].entity(entity, serv, options))
+    for (const plugin of plugins.builtinPlugins) plugin.entity?.(entity, serv, options)
 
     entity.initEntity(type, entityType, world, position)
 
@@ -55,10 +52,10 @@ module.exports.server = function (serv, options) {
       { key: 4, type: 7, value: false }
     ]
     let key = 5
-    if (mcData.version['>=']('1.10')) {
+    if (registry.version['>=']('1.10')) {
       object.metadata.push({ key, type: 7, value: false })
       ++key
-      if (mcData.version['>=']('1.14')) {
+      if (registry.version['>=']('1.14')) {
         object.metadata.push({ key, type: 18, value: 0 })
         ++key
       }
@@ -105,17 +102,18 @@ module.exports.server = function (serv, options) {
     delete serv.entities[entity.id]
   }
 
-  const entitiesByName = require('minecraft-data')(version).entitiesByName
+  const entitiesByName = serv.registry.entitiesByName
 
   serv.commands.add({
     base: 'summon',
     info: 'Summon an entity',
     usage: '/summon <entity_name>',
     onlyPlayer: true,
+    tab: ['entity'],
     op: true,
     action (name, ctx) {
       if (Object.keys(serv.entities).length > options['max-entities']) { throw new UserError('Too many mobs !') }
-      const entity = entitiesByName[name]
+      const entity = entitiesByName[skipMcPrefix(name)]
       if (!entity) {
         return 'No entity named ' + name
       }
@@ -135,6 +133,7 @@ module.exports.server = function (serv, options) {
     base: 'summonMany',
     info: 'Summon many entities',
     usage: '/summonMany <number> <entity_name>',
+    tab: ['number', 'entity'],
     onlyPlayer: true,
     op: true,
     parse (str) {
@@ -144,7 +143,7 @@ module.exports.server = function (serv, options) {
     },
     action ({ number, name }, ctx) {
       if (Object.keys(serv.entities).length > options['max-entities'] - number) { throw new UserError('Too many mobs !') }
-      const entity = entitiesByName[name]
+      const entity = entitiesByName[skipMcPrefix(name)]
       if (!entity) {
         return 'No entity named ' + name
       }
@@ -220,9 +219,9 @@ module.exports.server = function (serv, options) {
   })
 }
 
-module.exports.player = function (player, serv, options) {
-  const version = options.version
-  const Item = require('prismarine-item')(version)
+module.exports.player = function (player, serv, { version }) {
+  const { registry } = serv
+  const Item = require('prismarine-item')(registry)
 
   player.spawnEntity = entity => {
     player._client.write(entity.spawnPacketName, entity.getSpawnPacket())
@@ -298,9 +297,13 @@ module.exports.entity = function (entity, serv) {
     entity.bornTime = Date.now()
     serv.entities[entity.id] = entity
 
-    if (entity.type === 'player') entity.spawnPacketName = 'named_entity_spawn'
+    if (serv.supportFeature('unifiedPlayerAndEntitySpawnPacket')) entity.spawnPacketName = 'spawn_entity'
+    else if (entity.type === 'player') entity.spawnPacketName = 'named_entity_spawn'
     else if (entity.type === 'object') entity.spawnPacketName = 'spawn_entity'
-    else if (entity.type === 'mob') entity.spawnPacketName = 'spawn_entity_living'
+    else if (entity.type === 'mob') {
+      if (serv.supportFeature('consolidatedEntitySpawnPacket')) entity.spawnPacketName = 'spawn_entity'
+      else entity.spawnPacketName = 'spawn_entity_living'
+    }
   }
 
   entity.getSpawnPacket = () => {
@@ -317,49 +320,24 @@ module.exports.entity = function (entity, serv) {
       entityPosition = entity.position
     }
 
-    if (entity.type === 'player') {
-      return {
-        entityId: entity.id,
-        playerUUID: entity.uuid,
-        x: entityPosition.x,
-        y: entityPosition.y,
-        z: entityPosition.z,
-        yaw: entity.yaw,
-        pitch: entity.pitch,
-        currentItem: 0,
-        metadata: entity.metadata
-      }
-    } else if (entity.type === 'object') {
-      return {
-        entityId: entity.id,
-        objectUUID: entity.uuid,
-        type: entity.entityType,
-        x: entityPosition.x,
-        y: entityPosition.y,
-        z: entityPosition.z,
-        pitch: entity.pitch,
-        yaw: entity.yaw,
-        objectData: entity.data,
-        velocityX: scaledVelocity.x,
-        velocityY: scaledVelocity.y,
-        velocityZ: scaledVelocity.z
-      }
-    } else if (entity.type === 'mob') {
-      return {
-        entityId: entity.id,
-        entityUUID: entity.uuid,
-        type: entity.entityType,
-        x: entityPosition.x,
-        y: entityPosition.y,
-        z: entityPosition.z,
-        yaw: entity.yaw,
-        pitch: entity.pitch,
-        headPitch: entity.headPitch,
-        velocityX: scaledVelocity.x,
-        velocityY: scaledVelocity.y,
-        velocityZ: scaledVelocity.z,
-        metadata: entity.metadata
-      }
+    return {
+      entityId: entity.id,
+      playerUUID: entity.uuid,
+      entityUUID: entity.uuid,
+      objectUUID: entity.uuid,
+      type: entity.entityType,
+      x: entityPosition.x,
+      y: entityPosition.y,
+      z: entityPosition.z,
+      yaw: entity.yaw,
+      pitch: entity.pitch,
+      headPitch: entity.headPitch,
+      currentItem: 0,
+      objectData: entity.data,
+      velocityX: scaledVelocity.x,
+      velocityY: scaledVelocity.y,
+      velocityZ: scaledVelocity.z,
+      metadata: entity.metadata
     }
   }
 

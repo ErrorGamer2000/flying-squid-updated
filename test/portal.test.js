@@ -1,14 +1,12 @@
 /* eslint-env mocha */
-
+globalThis.isMocha = true
 const squid = require('flying-squid')
-const { firstVersion, lastVersion } = require('./common/parallel')
+const PortalDetector = require('../src/lib/portal_detector')
 const expect = require('expect').default
 
-squid.supportedVersions.forEach((supportedVersion, i) => {
-  if (!(i >= firstVersion && i <= lastVersion)) return
-
-  const mcData = require('minecraft-data')(supportedVersion)
-  const version = mcData.version
+squid.testedVersions.forEach((testedVersion, i) => {
+  const registry = require('prismarine-registry')(testedVersion)
+  const version = registry.version
 
   const {
     detectFrame,
@@ -18,11 +16,11 @@ squid.supportedVersions.forEach((supportedVersion, i) => {
     generateLine,
     generatePortal,
     makeWorldWithPortal
-  } = squid.portal_detector(version.minecraftVersion)
+  } = PortalDetector(registry)
 
   const { Vec3 } = require('vec3')
 
-  describe('generate portal ' + version.minecraftVersion, () => {
+  describe('generate portal ' + testedVersion + 'v', () => {
     it('generate a line', () => {
       expect(generateLine(new Vec3(3, 1, 1), new Vec3(1, 0, 0), 2)).toEqual([new Vec3(3, 1, 1), new Vec3(4, 1, 1)])
     })

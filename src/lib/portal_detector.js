@@ -2,11 +2,10 @@ const Vec3 = require('vec3').Vec3
 const flatMap = require('flatmap')
 const range = require('range').range
 
-module.exports = (version) => {
-  const World = require('prismarine-world')(version)
-  const Chunk = require('prismarine-chunk')(version)
-  const mcData = require('minecraft-data')(version)
-  const obsidianType = mcData.blocksByName.obsidian.id
+module.exports = (registry) => {
+  const World = require('prismarine-world')(registry)
+  const Chunk = require('prismarine-chunk')(registry)
+  const obsidianType = registry.blocksByName.obsidian.id
 
   async function findLineInDirection (world, startingPoint, type, direction, directionV) {
     const line = []

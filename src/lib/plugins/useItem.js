@@ -1,6 +1,6 @@
 module.exports.server = (serv, { version }) => {
-  const mcData = require('minecraft-data')(version)
-  const mobs = mcData.mobs
+  const { registry } = serv
+  const mobs = registry.mobs
 
   function getEntID (entName) {
     let foundID = ''
@@ -18,7 +18,7 @@ module.exports.server = (serv, { version }) => {
   serv.on('asap', () => { // On server ready
     if (serv.supportFeature('theFlattening')) { // >1.12 support
       for (const mob of Object.values(mobs)) {
-        const spawnEgg = mcData.itemsByName[mob.name + '_spawn_egg']
+        const spawnEgg = registry.itemsByName[mob.name + '_spawn_egg']
         if (spawnEgg) {
           serv.onItemPlace(spawnEgg.name, ({ player, placedPosition }) => {
             serv.spawnMob(mob.id, player.world, placedPosition)

@@ -1,12 +1,12 @@
 const Vec3 = require('vec3').Vec3
 
 module.exports.player = function (player, serv, { version }) {
-  const mcData = require('minecraft-data')(version)
+  const { registry } = serv
   function cancelDig ({ position, block }) {
     player.sendBlock(position, block.type)
   }
 
-  player._client.on('block_dig', async ({ location, status, face }) => {
+  player._client.on('block_dig', async ({ location, status, face, sequence }) => {
     if (status === 3 || status === 4) {
       const heldItem = player.inventory.slots[36 + player.heldItemSlot]
       if (!heldItem || heldItem.type === -1) return
@@ -56,12 +56,12 @@ module.exports.player = function (player, serv, { version }) {
         if (player.gameMode === 1) {
           creativeDigging(pos)
         } else {
-          startDigging(pos)
+          startDigging(pos, sequence)
         }
       } else if (status === 1 || player.gameMode >= 2) {
-        cancelDigging(pos)
+        cancelDigging(pos, sequence)
       } else if (status === 2) {
-        completeDigging(pos)
+        completeDigging(pos, sequence)
       }
     }
   })
@@ -77,7 +77,7 @@ module.exports.player = function (player, serv, { version }) {
   let expectedDiggingTime
   let lastDestroyState
   let currentAnimationId
-  function startDigging (location) {
+  function startDigging (location, sequenceId) {
     serv.entityMaxId++
     currentAnimationId = serv.entityMaxId
     expectedDiggingTime = diggingTime(location)
@@ -108,6 +108,7 @@ module.exports.player = function (player, serv, { version }) {
     }
     if (serv.supportFeature('acknowledgePlayerDigging')) {
       player._client.write('acknowledge_player_digging', {
+        sequenceId, // 1.19
         location,
         block: currentlyDugBlock.stateId,
         status: 0,
@@ -116,7 +117,7 @@ module.exports.player = function (player, serv, { version }) {
     }
   }
 
-  function cancelDigging (location) {
+  function cancelDigging (location, sequenceId) {
     clearInterval(animationInterval)
     player._writeOthersNearby('block_break_animation', {
       entityId: currentAnimationId,
@@ -125,6 +126,7 @@ module.exports.player = function (player, serv, { version }) {
     })
     if (serv.supportFeature('acknowledgePlayerDigging')) {
       player._client.write('acknowledge_player_digging', {
+        sequenceId, // 1.19
         location,
         block: currentlyDugBlock.stateId,
         status: 1,
@@ -133,7 +135,7 @@ module.exports.player = function (player, serv, { version }) {
     }
   }
 
-  async function completeDigging (location) {
+  async function completeDigging (location, sequenceId) {
     clearInterval(animationInterval)
     const diggingTime = new Date() - startDiggingTime
     let stop = false
@@ -153,7 +155,7 @@ module.exports.player = function (player, serv, { version }) {
         blockDropPickup: 500,
         blockDropDeath: 60 * 5 * 1000
       }
-      if (typeof mcData.blockLoot === 'undefined') {
+      if (typeof registry.blockLoot === 'undefined') {
         drops.push({
           ...dropBase,
           blockDropVelocity: new Vec3(Math.random() * 4 - 2, Math.random() * 2 + 2, Math.random() * 4 - 2),
@@ -162,12 +164,12 @@ module.exports.player = function (player, serv, { version }) {
       } else {
         const heldItem = player.inventory.slots[36 + player.heldItemSlot]
         const silkTouch = heldItem?.enchants.map(enchant => enchant.name).includes('silk_touch')
-        const blockDrops = mcData.blockLoot[currentlyDugBlock.name].drops.filter(drop => !(drop[`${silkTouch ? 'noS' : 's'}ilkTouch`] ?? false))
+        const blockDrops = registry.blockLoot[currentlyDugBlock.name].drops.filter(drop => !(drop[`${silkTouch ? 'noS' : 's'}ilkTouch`] ?? false))
         for (const drop of blockDrops) {
           drops.push({
             ...dropBase,
             blockDropVelocity: new Vec3(Math.random() * 4 - 2, Math.random() * 2 + 2, Math.random() * 4 - 2),
-            blockDropId: mcData.itemsByName[drop.item].id
+            blockDropId: registry.itemsByName[drop.item].id
           })
         }
       }
@@ -187,6 +189,7 @@ module.exports.player = function (player, serv, { version }) {
         }
         if (serv.supportFeature('acknowledgePlayerDigging')) {
           player._client.write('acknowledge_player_digging', {
+            sequenceId, // 1.19
             location,
             block: 0,
             status: 2,
@@ -201,6 +204,7 @@ module.exports.player = function (player, serv, { version }) {
       })
       if (serv.supportFeature('acknowledgePlayerDigging')) {
         player._client.write('acknowledge_player_digging', {
+          sequenceId, // 1.19
           location,
           block: currentlyDugBlock.stateId,
           status: 2,
@@ -211,7 +215,7 @@ module.exports.player = function (player, serv, { version }) {
   }
 
   function dropBlock ({ blockDropPosition, blockDropWorld, blockDropVelocity, blockDropId, blockDropDamage, blockDropCount, blockDropPickup, blockDropDeath }) {
-    serv.spawnObject(mcData.entitiesByName[mcData.version['<']('1.11') ? 'Item' : 'item'].id, blockDropWorld, blockDropPosition, {
+    serv.spawnObject(registry.entitiesByName[registry.version['<']('1.11') ? 'Item' : 'item'].id, blockDropWorld, blockDropPosition, {
       velocity: blockDropVelocity,
       itemId: blockDropId,
       itemDamage: blockDropDamage,

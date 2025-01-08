@@ -46,7 +46,8 @@ module.exports.player = function (player) {
     sendLook(yaw, pitch, onGround)
   })
 
-  player.sendSelfPosition = () => {
+  player.sendSelfPosition = (newPosition) => {
+    if (newPosition) player.position = newPosition
     // double position in all versions
     player._client.write('position', {
       x: player.position.x,
@@ -83,7 +84,7 @@ module.exports.player = function (player) {
 
 module.exports.entity = function (entity, serv) {
   entity.sendPosition = (position, onGround, teleport = false) => {
-    if (typeof position === 'undefined') throw new Error('undef')
+    if (typeof position === 'undefined') throw new Error('Undefined position')
     if (entity.position.equals(position) && entity.onGround === onGround) return Promise.resolve()
     return entity.behavior('move', {
       position,

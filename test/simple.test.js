@@ -1,21 +1,15 @@
 /* eslint-env mocha */
-
+globalThis.isMocha = true
 const net = require('net')
 const squid = require('flying-squid')
 
 const settings = require('../config/default-settings')
 
-const { firstVersion, lastVersion } = require('./common/parallel')
+squid.testedVersions.forEach((testedVersion, i) => {
+  const registry = require('prismarine-registry')(testedVersion)
+  const version = registry.version
 
-squid.supportedVersions.forEach((supportedVersion, i) => {
-  if (!(i >= firstVersion && i <= lastVersion)) {
-    return
-  }
-
-  const mcData = require('minecraft-data')(supportedVersion)
-  const version = mcData.version
-
-  describe(`simple server  ${version.minecraftVersion}`, () => {
+  describe(`simple server  ${testedVersion}v`, () => {
     let serv
 
     before(done => {

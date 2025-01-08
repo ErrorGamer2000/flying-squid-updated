@@ -1,28 +1,36 @@
-/* global BigInt */
 const Vec3 = require('vec3').Vec3
-
-const path = require('path')
 const crypto = require('crypto')
-const requireIndex = require('../requireindex')
-const plugins = requireIndex(path.join(__dirname, '..', 'plugins'))
 const playerDat = require('../playerDat')
 const convertInventorySlotId = require('../convertInventorySlotId')
+const plugins = require('./index')
 
 module.exports.server = function (serv, options) {
-  serv._server.on('connection', client =>
-    client.on('error', error => serv.emit('clientError', client, error)))
+  serv._server.on('connection', (client) => {
+    client.on('error', error => serv.emit('clientError', client, error))
+    client.on('state', (now) => {
+      if (now === 'configuration') {
+        client.write('feature_flags', { features: ['minecraft:vanilla'] })
+        // Should this be put into loginPacket.json.. or figure out how to generate it inside flying-squid/what parts we really need
+        // to send.
+        client.write('tags', require('./loginTags.json'))
+      }
+    })
+  })
 
-  serv._server.on('login', async (client) => {
-    if (client.socket.listeners('end').length === 0) return // TODO: should be fixed properly in nmp instead
+  serv._server.on('playerJoin', async (client) => {
+    if (!serv.pluginsReady) {
+      client.end('Server is still starting! Please wait before reconnecting.')
+      serv.info(`[${client.socket.remoteAddress}] ${client.username} (${client.uuid}) disconnected as server is still starting`)
+      return
+    }
+    serv.debug?.(`[login] ${client.socket?.remoteAddress} - ${client.username} (${client.uuid}) connected`, client.version, client.protocolVersion)
     try {
       const player = serv.initEntity('player', null, serv.overworld, new Vec3(0, 0, 0))
       player._client = client
 
       player.profileProperties = player._client.profile ? player._client.profile.properties : []
 
-      Object.keys(plugins)
-        .filter(pluginName => plugins[pluginName].player !== undefined)
-        .forEach(pluginName => plugins[pluginName].player(player, serv, options))
+      for (const plugin of plugins.builtinPlugins) plugin.player?.(player, serv, options)
 
       serv.emit('newPlayer', player)
       player.emit('asap')
@@ -42,10 +50,7 @@ module.exports.server = function (serv, options) {
 }
 
 module.exports.player = async function (player, serv, settings) {
-  const Item = require('prismarine-item')(settings.version)
-  const mcData = require('minecraft-data')(settings.version)
-
-  let playerData
+  const Item = require('prismarine-item')(serv.registry)
 
   async function addPlayer () {
     player.type = 'player'
@@ -56,26 +61,24 @@ module.exports.player = async function (player, serv, settings) {
 
     await player.findSpawnPoint()
 
-    playerData = await playerDat.read(player.uuid, player.spawnPoint, settings.worldFolder)
-    Object.keys(playerData.player).forEach(k => { player[k] = playerData.player[k] })
+    const playerData = player._playerData = await playerDat.read(player.uuid, player.spawnPoint, settings.worldFolder)
+    for (const key in playerData.player) player[key] = playerData.player[key]
 
-    serv.players.push(player)
+    if (!player.disconnected) {
+      // it's possible player gets kicked during login process ; don't add them to the server
+      serv.players.push(player)
+    }
     serv.uuidToPlayer[player.uuid] = player
     player.loadedChunks = {}
   }
 
   function updateInventory () {
-    playerData.inventory.forEach((item) => {
-      let theItem
-      const itemName = item.id.value.slice(10)
-      if (mcData.itemsByName[itemName]) {
-        theItem = mcData.itemsByName[itemName]
-      } else {
-        theItem = mcData.blocksByName[itemName]
-      }
+    player._playerData.inventory.forEach((item) => {
+      const itemName = item.id.value.slice(10) // skip game brand prefix
+      const theItem = serv.registry.itemsByName[itemName] || serv.registry.blocksByName[itemName]
 
       let newItem
-      if (mcData.version['<']('1.13')) newItem = new Item(theItem.id, item.Count.value, item.Damage.value)
+      if (serv.registry.version['<']('1.13')) newItem = new Item(theItem.id, item.Count.value, item.Damage.value)
       else if (item.tag) newItem = new Item(theItem.id, item.Count.value, item.tag)
       else newItem = new Item(theItem.id, item.Count.value)
 
@@ -90,14 +93,16 @@ module.exports.player = async function (player, serv, settings) {
   function sendLogin () {
     // send init data so client will start rendering world
     player._client.write('login', {
+      ...serv.registry.loginPacket,
+      enforcesSecureChat: serv._server.options.enforcesSecureChat,
       entityId: player.id,
       levelType: 'default',
       gameMode: player.gameMode,
-      previousGameMode: player.prevGameMode,
+      previousGameMode: 0,
       worldNames: Object.values(serv.dimensionNames),
-      dimensionCodec,
+      dimensionCodec: serv.registry.loginPacket?.dimensionCodec,
       worldName: serv.dimensionNames[0],
-      dimension: serv.supportFeature('dimensionIsAString') ? serv.dimensionNames[0] : 0,
+      dimension: (serv.supportFeature('dimensionIsAString') || serv.supportFeature('dimensionIsAWorld')) ? serv.registry.loginPacket.dimension : 0,
       hashedSeed: serv.hashedSeed,
       difficulty: serv.difficulty,
       viewDistance: settings['view-distance'],
@@ -117,7 +122,7 @@ module.exports.player = async function (player, serv, settings) {
 
   function sendChunkWhenMove () {
     player.on('move', () => {
-      if (!player.sendingChunks && player.position.distanceTo(player.lastPositionChunkUpdated) > 16) { player.sendRestMap() }
+      if (!player.sendingChunks && player.position.distanceTo(player.lastPositionChunkUpdated) > 16) { player.worldSendRestOfChunks() }
       if (!serv.supportFeature('updateViewPosition')) {
         return
       }
@@ -141,13 +146,24 @@ module.exports.player = async function (player, serv, settings) {
     })
   }
 
-  player.setGameMode = (gameMode) => {
-    if (gameMode !== player.gameMode) player.prevGameMode = player.gameMode
-    player.gameMode = gameMode
-    player._client.write('game_state_change', {
-      reason: 3,
-      gameMode: player.gameMode
+  // TODO: The structure of player_info changes alot between versions and is messy
+  // https://github.com/PrismarineJS/minecraft-data/pull/948 will fix some of it but
+  // merging that will also require updating mineflayer. In the meantime we can skip this
+  // packet in 1.19+ as it also requires some chat signing key logic to be implemented
+
+  serv._sendPlayerEventLeave = function (player) {
+    if (serv.registry.version['>=']('1.19')) return
+    player._writeOthers('player_info', {
+      action: 4,
+      data: [{
+        UUID: player.uuid,
+        uuid: player.uuid // 1.19.3+
+      }]
     })
+  }
+
+  serv._sendPlayerEventUpdateGameMode = function (player) {
+    if (serv.registry.version['>=']('1.19')) return
     serv._writeAll('player_info', {
       action: 1,
       data: [{
@@ -155,10 +171,21 @@ module.exports.player = async function (player, serv, settings) {
         gamemode: player.gameMode
       }]
     })
+  }
+
+  player.setGameMode = (gameMode) => {
+    if (gameMode !== player.gameMode) player.prevGameMode = player.gameMode
+    player.gameMode = gameMode
+    player._client.write('game_state_change', {
+      reason: 3,
+      gameMode: player.gameMode
+    })
+    serv._sendPlayerEventUpdateGameMode(player)
     player.sendAbilities()
   }
 
-  function fillTabList () {
+  serv._sendPlayerEventNewJoin = function (player) {
+    if (serv.registry.version['>=']('1.19')) return
     player._writeOthers('player_info', {
       action: 0,
       data: [{
@@ -169,8 +196,11 @@ module.exports.player = async function (player, serv, settings) {
         ping: player._client.latency
       }]
     })
+  }
 
-    player._client.write('player_info', {
+  serv._sendPlayerList = function (toPlayer) {
+    if (serv.registry.version['>=']('1.19')) return
+    toPlayer._writeOthers('player_info', {
       action: 0,
       data: serv.players.map((otherPlayer) => ({
         UUID: otherPlayer.uuid,
@@ -180,13 +210,19 @@ module.exports.player = async function (player, serv, settings) {
         ping: otherPlayer._client.latency
       }))
     })
-    setInterval(() => player._client.write('player_info', {
-      action: 2,
-      data: serv.players.map(otherPlayer => ({
-        UUID: otherPlayer.uuid,
-        ping: otherPlayer._client.latency
-      }))
-    }), 5000)
+  }
+
+  function fillTabList () {
+    serv._sendPlayerList(player)
+    if (serv.registry.version['<=']('1.18')) {
+      setInterval(() => player._client.write('player_info', {
+        action: 2,
+        data: serv.players.map(otherPlayer => ({
+          UUID: otherPlayer.uuid,
+          ping: otherPlayer._client.latency
+        }))
+      }), 5000)
+    }
   }
 
   function announceJoin () {
@@ -205,6 +241,18 @@ module.exports.player = async function (player, serv, settings) {
     })
   }
 
+  function sendStatus () {
+    player._client.write('held_item_slot', { slot: 0 })
+    player._client.write('entity_status', {
+      entityId: player.id,
+      entityStatus: 23
+    })
+    player._client.write('entity_status', {
+      entityId: player.id,
+      entityStatus: 24
+    })
+  }
+
   player.login = async () => {
     if (serv.uuidToPlayer[player.uuid]) {
       player.kick('You are already connected')
@@ -214,18 +262,19 @@ module.exports.player = async function (player, serv, settings) {
       player.kick(serv.bannedPlayers[player.uuid].reason)
       return
     }
-    if (serv.bannedIPs[player._client.socket.remoteAddress]) {
-      player.kick(serv.bannedIPs[player._client.socket.remoteAddress].reason)
+    if (serv.bannedIPs[player._client.socket?.remoteAddress]) {
+      player.kick(serv.bannedIPs[player._client.socket?.remoteAddress].reason)
       return
     }
 
     await addPlayer()
+    const pos = player.position
     sendLogin()
+    sendStatus()
     player.sendSpawnPosition()
     player.sendSelfPosition()
     player.sendAbilities()
-    await player.sendMap()
-    player.updateHealth(player.health)
+    await player.worldSendInitialChunks()
     player.setXp(player.xp)
     updateInventory()
 
@@ -234,254 +283,16 @@ module.exports.player = async function (player, serv, settings) {
     player.updateAndSpawn()
 
     announceJoin()
+    // mineflayer emits spawn event on health update so it needs to be done as last step
+    player.updateHealth(player.health)
     player.emit('spawned')
 
     await player.waitPlayerLogin()
-    player.sendRestMap()
+    player.worldSendRestOfChunks()
     sendChunkWhenMove()
-  }
 
-  const dimensionCodec = { // Dumped from a vanilla 1.16.1 server, as these are hardcoded constants
-    type: 'compound',
-    name: '',
-    value: {
-      dimension: {
-        type: 'list',
-        value: {
-          type: 'compound',
-          value: [
-            {
-              name: {
-                type: 'string',
-                value: 'minecraft:overworld'
-              },
-              bed_works: {
-                type: 'byte',
-                value: 1
-              },
-              shrunk: {
-                type: 'byte',
-                value: 0
-              },
-              piglin_safe: {
-                type: 'byte',
-                value: 0
-              },
-              has_ceiling: {
-                type: 'byte',
-                value: 0
-              },
-              has_skylight: {
-                type: 'byte',
-                value: 1
-              },
-              infiniburn: {
-                type: 'string',
-                value: 'minecraft:infiniburn_overworld'
-              },
-              ultrawarm: {
-                type: 'byte',
-                value: 0
-              },
-              ambient_light: {
-                type: 'float',
-                value: 0
-              },
-              logical_height: {
-                type: 'int',
-                value: 256
-              },
-              has_raids: {
-                type: 'byte',
-                value: 1
-              },
-              natural: {
-                type: 'byte',
-                value: 1
-              },
-              respawn_anchor_works: {
-                type: 'byte',
-                value: 0
-              }
-            }, /*, minecraft:overworld_caves is not implemented in flying-squid yet            {
-              "name": {
-                "type": "string",
-                "value": "minecraft:overworld_caves"
-              },
-              "bed_works": {
-                "type": "byte",
-                "value": 1
-              },
-              "shrunk": {
-                "type": "byte",
-                "value": 0
-              },
-              "piglin_safe": {
-                "type": "byte",
-                "value": 0
-              },
-              "has_ceiling": {
-                "type": "byte",
-                "value": 1
-              },
-              "has_skylight": {
-                "type": "byte",
-                "value": 1
-              },
-              "infiniburn": {
-                "type": "string",
-                "value": "minecraft:infiniburn_overworld"
-              },
-              "ultrawarm": {
-                "type": "byte",
-                "value": 0
-              },
-              "ambient_light": {
-                "type": "float",
-                "value": 0
-              },
-              "logical_height": {
-                "type": "int",
-                "value": 256
-              },
-              "has_raids": {
-                "type": "byte",
-                "value": 1
-              },
-              "natural": {
-                "type": "byte",
-                "value": 1
-              },
-              "respawn_anchor_works": {
-                "type": "byte",
-                "value": 0
-              }
-            } */
-            {
-              infiniburn: {
-                type: 'string',
-                value: 'minecraft:infiniburn_nether'
-              },
-              ultrawarm: {
-                type: 'byte',
-                value: 1
-              },
-              logical_height: {
-                type: 'int',
-                value: 128
-              },
-              natural: {
-                type: 'byte',
-                value: 0
-              },
-              name: {
-                type: 'string',
-                value: 'minecraft:the_nether'
-              },
-              bed_works: {
-                type: 'byte',
-                value: 0
-              },
-              fixed_time: {
-                type: 'long',
-                value: [
-                  0,
-                  18000
-                ]
-              },
-              shrunk: {
-                type: 'byte',
-                value: 1
-              },
-              piglin_safe: {
-                type: 'byte',
-                value: 1
-              },
-              has_skylight: {
-                type: 'byte',
-                value: 0
-              },
-              has_ceiling: {
-                type: 'byte',
-                value: 1
-              },
-              ambient_light: {
-                type: 'float',
-                value: 0.1
-              },
-              has_raids: {
-                type: 'byte',
-                value: 0
-              },
-              respawn_anchor_works: {
-                type: 'byte',
-                value: 1
-              }
-            }/*, minecraft:the_end is not implemented in flying-squid yet
-            {
-              "infiniburn": {
-                "type": "string",
-                "value": "minecraft:infiniburn_end"
-              },
-              "ultrawarm": {
-                "type": "byte",
-                "value": 0
-              },
-              "logical_height": {
-                "type": "int",
-                "value": 256
-              },
-              "natural": {
-                "type": "byte",
-                "value": 0
-              },
-              "name": {
-                "type": "string",
-                "value": "minecraft:the_end"
-              },
-              "bed_works": {
-                "type": "byte",
-                "value": 0
-              },
-              "fixed_time": {
-                "type": "long",
-                "value": [
-                  0,
-                  6000
-                ]
-              },
-              "shrunk": {
-                "type": "byte",
-                "value": 0
-              },
-              "piglin_safe": {
-                "type": "byte",
-                "value": 0
-              },
-              "has_skylight": {
-                "type": "byte",
-                "value": 0
-              },
-              "has_ceiling": {
-                "type": "byte",
-                "value": 0
-              },
-              "ambient_light": {
-                "type": "float",
-                "value": 0
-              },
-              "has_raids": {
-                "type": "byte",
-                "value": 1
-              },
-              "respawn_anchor_works": {
-                "type": "byte",
-                "value": 0
-              }
-            } */
-          ]
-        }
-      }
-    }
+    // Prevent player from sometimes falling through the world on login by resending their login position
+    player.sendSelfPosition(pos)
+    await player.save()
   }
 }

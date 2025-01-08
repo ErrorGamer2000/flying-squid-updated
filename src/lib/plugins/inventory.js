@@ -1,8 +1,8 @@
 const Vec3 = require('vec3')
 
 module.exports.player = function (player, serv, { version }) {
-  const Item = require('prismarine-item')(version)
-  const windows = require('prismarine-windows')(version)
+  const Item = require('prismarine-item')(serv.registry)
+  const windows = require('prismarine-windows')(serv.registry)
 
   player.heldItemSlot = 0
   player.heldItem = new Item(256, 1)

@@ -1,8 +1,8 @@
 module.exports.server = (serv, { version }) => {
-  const mcData = require('minecraft-data')(version)
+  const { registry } = serv
 
-  const oakSign = serv.supportFeature('theFlattening') ? mcData.blocksByName.sign : mcData.blocksByName.standing_sign
-  const oakWallSign = mcData.blocksByName.wall_sign
+  const oakSign = serv.supportFeature('theFlattening') ? registry.blocksByName.oak_sign : registry.blocksByName.standing_sign
+  const oakWallSign = registry.blocksByName.wall_sign
 
   serv.on('asap', () => {
     if (serv.supportFeature('theFlattening')) {
@@ -15,7 +15,8 @@ module.exports.server = (serv, { version }) => {
         }
 
         player._client.write('open_sign_entity', {
-          location: placedPosition
+          location: placedPosition,
+          isFrontText: true // 1.20 allows sign text both sides, unsupported atm
         })
 
         const data = serv.setBlockDataProperties(block.defaultState - block.minStateId, block.states, properties)
@@ -32,7 +33,8 @@ module.exports.server = (serv, { version }) => {
         if (direction === 0) return { id: -1, data: 0 }
 
         player._client.write('open_sign_entity', {
-          location: placedPosition
+          location: placedPosition,
+          isFrontText: true // 1.20 allows sign text both sides, unsupported atm
         })
 
         if (direction === 1) {

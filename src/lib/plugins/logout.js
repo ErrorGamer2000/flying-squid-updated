@@ -1,5 +1,4 @@
-const once = require('event-promise')
-const playerDat = require('../playerDat')
+const { once } = require('events')
 
 module.exports.server = function (serv) {
   serv.quit = async (reason = 'Server closed') => {
@@ -7,8 +6,7 @@ module.exports.server = function (serv) {
       player.kick(reason)
       return once(player, 'disconnected')
     }))
-    serv._server.close()
-    await once(serv._server, 'close')
+    await serv.destroy()
   }
 }
 
@@ -18,15 +16,10 @@ module.exports.player = function (player, serv, { worldFolder }) {
   })
 
   player._client.on('end', async () => {
-    if (player && player.username) {
-      player._unloadAllChunks()
-      serv.broadcast(serv.color.yellow + player.username + ' left the game.')
-      player._writeOthers('player_info', {
-        action: 4,
-        data: [{
-          UUID: player.uuid
-        }]
-      })
+    if (!player.disconnected) {
+      player._unloadAllChunks(true /* becasuePlayerLeft */)
+      if (player.username) serv.broadcast(serv.color.yellow + player.username + ' left the game.')
+      serv._sendPlayerEventLeave(player)
       player.nearbyPlayers().forEach(otherPlayer => otherPlayer.despawnEntities([player]))
       delete serv.entities[player.id]
       player.emit('disconnected')
@@ -35,8 +28,10 @@ module.exports.player = function (player, serv, { worldFolder }) {
         serv.players.splice(index, 1)
       }
       delete serv.uuidToPlayer[player.uuid]
+      player.disconnected = true
     }
 
-    playerDat.save(player, worldFolder, serv.supportFeature('attributeSnakeCase'), serv.supportFeature('theFlattening'))
+    player.save()
+    player._client.socket?.destroy()
   })
 }

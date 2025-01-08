@@ -11,12 +11,17 @@ const materialToSound = {
 }
 
 module.exports.server = (serv, { version }) => {
-  const mcData = require('minecraft-data')(version)
+  const { registry } = serv
 
   const itemPlaceHandlers = new Map()
   serv.placeItem = (data) => {
-    const handler = itemPlaceHandlers.get(data.item.type)
-    return handler ? handler(data) : (serv.supportFeature('theFlattening') ? {} : { id: data.item.type, data: data.item.metadata })
+    const item = data.item
+    const handler = itemPlaceHandlers.get(item.type)
+    if (handler) return handler(data)
+    const block = registry.blocksByName[item.name]
+    if (!block) return {}
+    if (block.states?.length > 0) return { id: block.id, data: serv.setBlockDataProperties(block.defaultState - block.minStateId, block.states, data.properties) }
+    return { id: block.id, data: item.metadata ?? 0 }
   }
 
   /**
@@ -26,8 +31,8 @@ module.exports.server = (serv, { version }) => {
    * It should return the id and data of the block to place
    */
   serv.onItemPlace = (name, handler, warn = true) => {
-    let item = mcData.itemsByName[name]
-    if (!item) item = mcData.blocksByName[name]
+    let item = registry.itemsByName[name]
+    if (!item) item = registry.blocksByName[name]
     if (itemPlaceHandlers.has(item.id) && warn) {
       serv.warn(`onItemPlace handler was registered twice for ${name}`)
     }
@@ -60,23 +65,6 @@ module.exports.server = (serv, { version }) => {
       }
       return data
     }
-
-    // Register default handlers for item -> block conversion
-    for (const name of Object.keys(mcData.itemsByName)) {
-      const block = mcData.blocksByName[name]
-      if (block) {
-        if (block.states.length > 0) {
-          serv.onItemPlace(name, ({ properties }) => {
-            const data = block.defaultState - block.minStateId
-            return { id: block.id, data: serv.setBlockDataProperties(data, block.states, properties) }
-          })
-        } else {
-          serv.onItemPlace(name, () => {
-            return { id: block.id, data: 0 }
-          })
-        }
-      }
-    }
   }
 
   const blockInteractHandler = new Map()
@@ -92,7 +80,7 @@ module.exports.server = (serv, { version }) => {
    * cancelled.
    */
   serv.onBlockInteraction = (name, handler) => {
-    const block = mcData.blocksByName[name]
+    const block = registry.blocksByName[name]
     if (blockInteractHandler.has(block.id)) {
       serv.warn(`onBlockInteraction handler was registered twice for ${name}`)
     }
@@ -101,8 +89,8 @@ module.exports.server = (serv, { version }) => {
 }
 
 module.exports.player = function (player, serv, { version }) {
-  const mcData = require('minecraft-data')(version)
-  const blocks = mcData.blocks
+  const { registry } = serv
+  const blocks = registry.blocks
 
   player._client.on('block_place', async ({ direction, location, cursorY } = {}) => {
     const referencePosition = new Vec3(location.x, location.y, location.z)
@@ -115,7 +103,7 @@ module.exports.player = function (player, serv, { version }) {
     const heldItem = player.inventory.slots[36 + player.heldItemSlot]
     if (!heldItem || direction === -1 || heldItem.type === -1) return
 
-    const directionVector = block.name === 'grass' ? new Vec3(0, 0, 0) : directionToVector[direction]
+    const directionVector = block.boundingBox === 'empty' ? new Vec3(0, 0, 0) : directionToVector[direction]
     const placedPosition = referencePosition.plus(directionVector)
     if (placedPosition.equals(player.position.floored())) return
     const dx = player.position.x - (placedPosition.x + 0.5)
@@ -141,7 +129,7 @@ module.exports.player = function (player, serv, { version }) {
         axis: directionToAxis[direction],
         facing: directionToFacing[Math.floor(angle / 90 + 0.5) & 0x3],
         half,
-        waterlogged: (await player.world.getBlock(placedPosition)).type === mcData.blocksByName.water.id
+        waterlogged: (await player.world.getBlock(placedPosition)).type === registry.blocksByName.water.id
       }
     })
 
